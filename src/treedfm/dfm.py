@@ -11,7 +11,7 @@ import torch.nn as nn
 from .corruption import NoiseConfig, corrupt_batch_tree
 from .losses import PermutationEditFlowLoss
 from .model import TreeEditTransformer
-from .schedule import DepthStratifiedSchedule
+from .schedule import DepthStratifiedSchedule, ProfiledDepthSchedule
 from .utils import build_child_slot_types, TreeUtils
 from .sampler import sample_tree_ctmc
 
@@ -42,11 +42,12 @@ class TreeEditDFM(nn.Module):
         max_spurious_per_tree: int = 64,
         avoid_substitution_identity: bool = True,
         permutation_invariant: bool = True,
-        root_type: int = 1,
+        root_type: int = 2,
         d_model: int = 384,
         n_heads: int = 8,
         n_layers: int = 8,
         dropout: float = 0.1,
+        scheduler: Optional[object] = None,
     ):
         super().__init__()
         self.num_types = int(num_types)
@@ -55,11 +56,19 @@ class TreeEditDFM(nn.Module):
         self.max_nodes = int(max_nodes)
         self.root_type = int(root_type)
 
-        self.scheduler = DepthStratifiedSchedule(
-            max_depth=max_depth,
-            width=schedule_width,
-            max_psi=schedule_max_psi,
-        )
+        if scheduler is None:
+            self.scheduler = DepthStratifiedSchedule(
+                max_depth=max_depth,
+                width=schedule_width,
+                max_psi=schedule_max_psi,
+            )
+        else:
+            # We only require the schedule object to expose:
+            #   - max_depth (int)
+            #   - kappa(t, depths)
+            #   - psi(t, depths)
+            self.scheduler = scheduler
+
         self.noise = NoiseConfig(
             p_blank_when_target_token=p_blank_when_target_token,
             p_blank_when_target_blank=p_blank_when_target_blank,

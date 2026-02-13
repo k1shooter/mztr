@@ -65,3 +65,288 @@ class DepthStratifiedSchedule:
 
     def kappa_and_psi(self, t: torch.Tensor, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.kappa(t, depths), self.psi(t, depths)
+
+@dataclass
+class DepthProfile:
+    """Summary statistics used to build a profiled depth schedule.
+
+    Attributes
+    ----------
+    counts:
+        A length-(max_depth+1) tensor. counts[d] is the (estimated) number of
+        *relevant coordinates* at depth d.
+
+        - If count_mode == "nodes": number of nodes at depth d.
+        - If count_mode == "all_slots": number of parent-slots that *could* create
+          a child at depth d, i.e. k * (#nodes at depth d-1).
+
+    max_depth:
+        Max depth used to clip counts.
+    """
+
+    counts: torch.Tensor
+    max_depth: int
+
+
+class ProfiledDepthSchedule:
+    """Piecewise-linear depth schedule with *depth-dependent* windows.
+
+    This schedule is designed to be "plug-compatible" with DepthStratifiedSchedule
+    (implements kappa/psi/kappa_and_psi and exposes max_depth).
+
+    For each depth d we define a start time s[d] and width w[d] (both in [0,1]):
+
+        kappa_d(t) = clamp((t - s[d]) / w[d], 0, 1)
+
+    with the convention that if w[d] is very small the transition is almost
+    instantaneous.
+
+    psi(t,d) is computed as kappa_dot/(1-kappa) inside the active window
+    [s[d], s[d] + w[d]) and clipped for numerical stability.
+    """
+
+    def __init__(
+        self,
+        *,
+        starts: torch.Tensor,
+        widths: torch.Tensor,
+        max_psi: float = 200.0,
+    ):
+        if starts.dim() != 1 or widths.dim() != 1 or starts.numel() != widths.numel():
+            raise ValueError("starts/widths must be 1D tensors of the same length")
+        if (widths <= 0).any():
+            raise ValueError("all widths must be > 0")
+
+        self.starts = starts.detach().float().clone()  # [D+1]
+        self.widths = widths.detach().float().clone()  # [D+1]
+        self.max_depth = int(self.starts.numel() - 1)
+        self.max_psi = float(max_psi)
+
+    def _gather(self, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather start/width per depth index and broadcast to `depths` shape."""
+        device = depths.device
+        d = depths.clamp(min=0, max=self.max_depth).long()
+        s = self.starts.to(device)[d]
+        w = self.widths.to(device)[d]
+        return s, w
+
+    def kappa(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        if t.dim() != 1:
+            raise ValueError("t must be shape [B]")
+        # Broadcast t to match depths
+        t_b = t.to(depths.device).view(-1, *([1] * (depths.dim() - 1))).expand_as(depths).float()
+        s, w = self._gather(depths)
+        progress = (t_b - s) / w
+        return torch.clamp(progress, 0.0, 1.0)
+
+    def psi(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        if t.dim() != 1:
+            raise ValueError("t must be shape [B]")
+        t_b = t.to(depths.device).view(-1, *([1] * (depths.dim() - 1))).expand_as(depths).float()
+        s, w = self._gather(depths)
+        t_end = s + w
+        in_window = (t_b >= s) & (t_b < t_end)
+
+        kappa = self.kappa(t, depths)
+        denom = torch.clamp(1.0 - kappa, min=1e-6)
+        kdot = (1.0 / w) * in_window.float()
+        psi = kdot / denom
+        psi = torch.clamp(psi, 0.0, self.max_psi)
+        psi = psi * in_window.float()
+        return psi
+
+    def kappa_and_psi(self, t: torch.Tensor, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.kappa(t, depths), self.psi(t, depths)
+
+
+CountMode = Literal["nodes", "all_slots"]
+
+
+def estimate_depth_profile(
+    samples: Iterable[torch.Tensor],
+    *,
+    max_depth: int,
+    k: int = 3,
+    count_mode: CountMode = "nodes",
+    include_root: bool = False,
+) -> DepthProfile:
+    """Estimate depth counts n_d from a dataset or list of [Ni,4] tensors.
+
+    Parameters
+    ----------
+    samples:
+        Iterable of tensors shaped [Ni,4] with columns (depth, rank, type, parent_idx).
+        This is exactly what MazeTreeDataset returns.
+
+    max_depth:
+        Maximum depth to count (depths are clipped to this).
+
+    k:
+        Branching factor (only used for count_mode="all_slots").
+
+    count_mode:
+        - "nodes": counts[d] = #nodes at depth d
+        - "all_slots": counts[d] = k * #nodes at depth (d-1)
+          (the number of parent-slots that could generate a child at depth d)
+
+    include_root:
+        Whether to include depth 0 in the returned counts.
+
+    Returns
+    -------
+    DepthProfile(counts, max_depth)
+    """
+
+    md = int(max_depth)
+    counts = torch.zeros((md + 1,), dtype=torch.float64)
+
+    # First pass: count nodes per depth
+    for x in samples:
+        if x.dim() != 2 or x.size(-1) != 4:
+            raise ValueError(f"Expected sample [N,4], got {tuple(x.shape)}")
+        d = x[:, 0].clamp(min=0, max=md).to(torch.long)
+        # In these maze datasets, all rows are real nodes (no padding here).
+        # Still, if someone passes padded tensors, we can optionally ignore type==0.
+        if (x[:, 2] == 0).any():
+            d = d[x[:, 2] > 0]
+        if d.numel() == 0:
+            continue
+        binc = torch.bincount(d, minlength=md + 1).to(torch.float64)
+        counts += binc
+
+    if not include_root:
+        counts[0] = 0.0
+
+    if count_mode == "nodes":
+        pass
+    elif count_mode == "all_slots":
+        # counts_slots[d] = k * nodes[d-1]
+        nodes = counts.clone()
+        counts = torch.zeros_like(nodes)
+        counts[1:] = float(k) * nodes[:-1]
+        counts[0] = 0.0
+    else:
+        raise ValueError(f"Unknown count_mode: {count_mode}")
+
+    return DepthProfile(counts=counts.to(torch.float32), max_depth=md)
+
+
+def make_profiled_sequential_schedule(
+    profile: DepthProfile,
+    *,
+    smoothing: float = 1.0,
+    power: float = 1.0,
+    min_width: float = 1e-3,
+    max_psi: float = 200.0,
+    t0: float = 0.0,
+    t1: float = 1.0,
+    include_root: bool = False,
+    overlap: float = 0.0,
+) -> ProfiledDepthSchedule:
+    """Build a *sequential* depth schedule from a depth profile.
+
+    The idea is to allocate a time window to each depth proportionally to the
+    depth "mass" n_d so that the total expected flux is roughly uniform:
+
+        sum_d n_d * kappa_dot_d(t) \approx const.
+
+    We construct piecewise-linear ramps per depth:
+      - depth d is inactive before its start s[d]
+      - ramps linearly to 1 over width w[d]
+      - stays at 1 afterwards
+
+    Parameters
+    ----------
+    smoothing:
+        Additive smoothing added to counts before normalization.
+        Useful to avoid zero-width depths.
+
+    power:
+        Optional tempering on the counts: w_d \propto (n_d + smoothing)^power.
+        power < 1 compresses the dynamic range.
+
+    min_width:
+        Lower bound on each width (in time units). Ensures finite kappa_dot.
+
+    include_root:
+        If False (default), depth 0 gets a tiny width and start=0 but does not
+        affect normalization. Root is typically forced to exist anyway.
+
+    overlap:
+        Fraction in [0,1). If > 0, we allow adjacent depth windows to overlap.
+        This can soften the curriculum at the cost of increased projection error.
+
+    Returns
+    -------
+    ProfiledDepthSchedule
+    """
+
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError("overlap must be in [0,1)")
+    if t1 <= t0:
+        raise ValueError("t1 must be > t0")
+    md = int(profile.max_depth)
+    counts = profile.counts.detach().float().clone()
+    if counts.numel() != md + 1:
+        raise ValueError("profile.counts must have length max_depth+1")
+
+    # Depths we actually schedule (by default: 1..max_depth)
+    sched_mask = torch.ones_like(counts, dtype=torch.bool)
+    if not include_root:
+        sched_mask[0] = False
+
+    # Smoothing + tempering
+    w = torch.zeros_like(counts)
+    w[sched_mask] = torch.clamp(counts[sched_mask] + float(smoothing), min=0.0) ** float(power)
+
+    total = float(w[sched_mask].sum().item())
+    if total <= 0:
+        # Fallback: uniform over depths 1..md
+        w[sched_mask] = 1.0
+        total = float(w[sched_mask].sum().item())
+
+    # Normalize to time budget
+    budget = float(t1 - t0)
+    w = w / total
+    widths = torch.clamp(w * budget, min=float(min_width))
+
+    # Renormalize widths to exactly match budget (preserving min_width constraints).
+    # If min_width makes it impossible (too many active depths), we still do a best-effort scale.
+    active = sched_mask & (widths > 0)
+    sum_w = float(widths[active].sum().item())
+    if sum_w > 0:
+        scale = budget / sum_w
+        widths[active] = widths[active] * scale
+
+    # Build start times sequentially
+    starts = torch.zeros_like(widths)
+    cur = float(t0)
+    for d in range(md + 1):
+        if not active[d]:
+            starts[d] = float(t1)  # effectively never turns on
+            continue
+        starts[d] = cur
+        cur += float(widths[d].item())
+
+    # Force the last scheduled depth to end exactly at t1
+    # (numerical drift from float ops can leave a small gap).
+    last_d = int(torch.nonzero(active, as_tuple=False)[-1].item())
+    end_last = float(starts[last_d].item() + widths[last_d].item())
+    if abs(end_last - float(t1)) > 1e-6:
+        widths[last_d] = max(float(min_width), widths[last_d].item() + (float(t1) - end_last))
+
+    # Optional overlap: shift starts backward by overlap fraction of previous width.
+    if overlap > 0:
+        prev_width = 0.0
+        for d in range(md + 1):
+            if not active[d]:
+                continue
+            starts[d] = max(float(t0), float(starts[d].item()) - overlap * prev_width)
+            prev_width = float(widths[d].item())
+
+    # Root handling: if excluded, keep it "always on" by setting start=0 and width=min_width.
+    if not include_root:
+        starts[0] = float(t0)
+        widths[0] = float(min_width)
+
+    return ProfiledDepthSchedule(starts=starts, widths=widths, max_psi=max_psi)

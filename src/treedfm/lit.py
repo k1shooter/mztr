@@ -34,7 +34,7 @@ class TreeEditDFM(pl.LightningModule):
         p_blank_when_target_blank: float = 0.98,
         max_spurious_per_tree: int = 64,
         permutation_invariant: bool = True,
-        root_type: int = 1,
+        root_type: int = 2,
     ):
         super().__init__()
         self.save_hyperparameters()

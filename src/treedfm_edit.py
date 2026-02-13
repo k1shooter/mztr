@@ -33,8 +33,22 @@ def main():
                         help="Pad all trees to this length (e.g., 2*N). Enables spurious nodes in padding region.")
 
     # Schedule
-    parser.add_argument("--schedule_width", type=float, default=0.5)
     parser.add_argument("--schedule_max_psi", type=float, default=200.0)
+    parser.add_argument(
+        "--schedule_mode",
+        type=str,
+        default="simple",
+        choices=["simple", "profiled"],
+        help="simple: t_start=d/max_depth with fixed width. profiled: dataset-profiled sequential schedule.",
+    )
+    # simple schedule
+    parser.add_argument("--schedule_width", type=float, default=0.5)
+    # profiled schedule
+    parser.add_argument("--profile_count_mode", type=str, default="nodes", choices=["nodes", "all_slots"])
+    parser.add_argument("--profile_smoothing", type=float, default=1.0)
+    parser.add_argument("--profile_power", type=float, default=1.0)
+    parser.add_argument("--profile_min_width", type=float, default=1e-3)
+    parser.add_argument("--profile_overlap", type=float, default=0.0)
 
     # Noise
     parser.add_argument("--p_blank_token", type=float, default=0.9)
@@ -97,6 +111,28 @@ def main():
         drop_last=True,
     )
 
+    # Build schedule
+    scheduler = None
+    if args.schedule_mode == "profiled":
+        profile = estimate_depth_profile(
+            ds.data,
+            max_depth=args.max_depth,
+            k=args.k,
+            count_mode=args.profile_count_mode,
+            include_root=False,
+        )
+        scheduler = make_profiled_sequential_schedule(
+            profile,
+            smoothing=args.profile_smoothing,
+            power=args.profile_power,
+            min_width=args.profile_min_width,
+            max_psi=args.schedule_max_psi,
+            include_root=False,
+            overlap=args.profile_overlap,
+        )
+        print("[info] Using profiled sequential schedule.")
+        print("       depth mass (top 10 depths):", profile.counts[:10].tolist())
+
     model = TreeEditDFM(
         num_types=args.num_types,
         k=args.k,
@@ -155,7 +191,7 @@ def main():
                 )
 
             # Track loss for plots (per-step, but record the *true* global step).
-            monitor.record_loss(float(loss.item()), step=global_step)
+            monitor.record_loss(float(loss.item()), step=global_step, epoch=epoch)
 
         dt = time.time() - t0
         print(f"Epoch {epoch:03d} finished in {dt:.1f}s")

@@ -26,6 +26,7 @@ class History:
     # Per-step loss trace
     loss_steps: List[int]
     loss_history: List[float]
+    loss_epochs: List[float]
 
     # Sampling trace (recorded at sampling time)
     sample_steps: List[int]
@@ -70,6 +71,7 @@ class TrainingMonitor:
         self.history = History(
             loss_steps=[],
             loss_history=[],
+            loss_epochs=[],
             sample_steps=[],
             sample_epochs=[],
             sample_avg_nodes=[],
@@ -77,10 +79,11 @@ class TrainingMonitor:
             sample_exact_rate=[],
         )
 
-    def record_loss(self, loss_value: float, *, step: int) -> None:
+    def record_loss(self, loss_value: float, *, step: int, epoch: float) -> None:
         """Record a single loss value at a specific global training step."""
         self.history.loss_steps.append(int(step))
         self.history.loss_history.append(float(loss_value))
+        self.history.loss_epochs.append(float(epoch))
 
     def maybe_sample_and_save(self, *, epoch: int, step: int, model, tree_plot_fn) -> None:
         """If `epoch` hits the interval, sample, save images, and update plots.
@@ -128,18 +131,30 @@ class TrainingMonitor:
 
         fig, ax1 = plt.subplots(figsize=(10, 5))
         # Plot loss against *actual* global steps.
-        ax1.plot(self.history.loss_steps, self.history.loss_history)
-        ax1.set_ylabel("Loss")
-        ax1.set_xlabel("Training step")
-        # Avoid confusing matplotlib padding: lock x-limits to the recorded range.
-        if self.history.loss_steps:
-            ax1.set_xlim(self.history.loss_steps[0], self.history.loss_steps[-1])
 
-        # Secondary y-axis: average sampled tree size (aligned to the step at which we sampled).
-        if len(self.history.sample_steps) > 0:
+        if len(self.history.loss_epochs) == len(self.history.loss_history):
+            x_loss = self.history.loss_epochs
+            xlabel = "Epoch"
+        else:
+            # If no epoch info, fall back to simple index (old behavior)
+            x_loss = range(len(self.history.loss_history))
+            xlabel = "Steps (or Epoch Index)"
+
+        ax1.plot(x_loss, self.history.loss_history, label='Loss', color='blue', alpha=0.6)
+        ax1.set_ylabel("Loss", color='blue')
+        ax1.set_xlabel(xlabel)
+        ax1.tick_params(axis='y', labelcolor='blue')
+
+        if len(self.history.sample_epochs) > 0:
             ax2 = ax1.twinx()
-            ax2.plot(self.history.sample_steps, self.history.sample_avg_nodes, marker="o")
-            ax2.set_ylabel("Sample avg #nodes")
+            # Plot against sample_epochs (which are integers like 10, 20, 30)
+            ax2.plot(self.history.sample_epochs, self.history.sample_avg_nodes, 
+                     color='red', marker="o", label='Avg Nodes')
+            ax2.set_ylabel("Sample avg #nodes", color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+            
+            # Align grid
+            # ax2.grid(None) # Optional: remove grid from 2nd axis to avoid clutter
 
         plt.title("Training loss & sampled tree size")
         plt.tight_layout()

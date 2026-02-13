@@ -45,7 +45,7 @@ def sample_tree_ctmc(
     max_nodes: int = 256,
     k: int = 3,
     num_types: int = 3,
-    root_type: int = 1,
+    root_type: int = 2,
     temperature: float = 1.0,
     device: torch.device | None = None,
 ) -> List[List[List[int]]]:
