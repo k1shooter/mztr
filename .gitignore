@@ -4,3 +4,4 @@
 *runs*
 *.pkl
 *__pycache__*
+*sample*.png
