@@ -1,0 +1,8 @@
+torch
+pytorch-lightning
+numpy
+matplotlib
+networkx
+einops
+tqdm
+scipy
