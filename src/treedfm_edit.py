@@ -10,7 +10,7 @@ from treedfm.data import MazeTreeDataset, collate_tree_batch
 from treedfm.dfm import TreeEditDFM
 from treedfm.monitor import TrainingMonitor
 from treedfm.utils import TreeUtils
-
+from treedfm.schedule import estimate_depth_profile, make_profiled_sequential_schedule
 
 def main():
     parser = argparse.ArgumentParser()
