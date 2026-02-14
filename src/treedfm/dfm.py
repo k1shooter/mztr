@@ -12,9 +12,80 @@ from .corruption import NoiseConfig, corrupt_batch_tree
 from .losses import PermutationEditFlowLoss
 from .model import TreeEditTransformer
 from .schedule import DepthStratifiedSchedule, ProfiledDepthSchedule
-from .utils import build_child_slot_types, TreeUtils
+from .utils import build_child_slot_types, TreeUtils, pad_sequence
 from .sampler import sample_tree_ctmc
 
+def _bfs_canonicalize_batch_with_orig_idx(x: torch.Tensor, pad_mask: torch.Tensor, k: int):
+    """
+    x: [B,N,4], pad_mask: [B,N]
+    returns:
+      x_can: [B,Nc,4]  (active-only BFS order, parent_idx remapped)
+      pad_can: [B,Nc]
+      orig_idx: [B,Nc]  (new node -> old index in x (== index in x1); pad rows are -1)
+    """
+    B, N, _ = x.shape
+    device = x.device
+
+    x_list = []
+    orig_list = []
+
+    for b in range(B):
+        xb = x[b]
+        pb = pad_mask[b]
+
+        # Build child map (parent_idx, rank) -> child_idx (old indices)
+        child_map = {}
+        parents = xb[:, 3].tolist()
+        ranks = xb[:, 1].tolist()
+        types = xb[:, 2].tolist()
+
+        for idx in range(N):
+            if bool(pb[idx]):
+                continue
+            p = int(parents[idx])
+            if p < 0:
+                continue
+            r = int(ranks[idx])
+            if 0 <= r < k:
+                child_map[(p, r)] = idx
+
+        clean = []
+        orig = []
+        queue = [(0, -1)]  # (old_idx, new_parent_idx)
+
+        while queue:
+            old, new_parent = queue.pop(0)
+            if old < 0 or old >= N:
+                continue
+            if bool(pb[old]):
+                continue
+            if int(types[old]) == 0:
+                continue
+
+            new_idx = len(clean)
+            depth = int(xb[old, 0].item())
+            rank = int(xb[old, 1].item())
+            typ  = int(xb[old, 2].item())
+            clean.append([depth, rank, typ, int(new_parent)])
+            orig.append(int(old))
+
+            for r in range(k):
+                c = child_map.get((old, r))
+                if c is not None:
+                    queue.append((c, new_idx))
+
+        # safety (shouldn't happen because root is forced to exist)
+        if len(clean) == 0:
+            clean = [[0, 0, 0, -1]]
+            orig = [-1]
+
+        x_list.append(torch.tensor(clean, dtype=torch.long, device=device))
+        orig_list.append(torch.tensor(orig, dtype=torch.long, device=device))
+
+    x_can, pad_can = pad_sequence(x_list, padding_value=0, pad_to=None)
+    orig_can, _ = pad_sequence([o.unsqueeze(1) for o in orig_list], padding_value=-1, pad_to=x_can.size(1))
+    orig_can = orig_can.squeeze(-1)
+    return x_can.to(device), pad_can.to(device), orig_can.to(device)
 
 class TreeEditDFM(nn.Module):
     """
@@ -114,6 +185,7 @@ class TreeEditDFM(nn.Module):
             scheduler=self.scheduler,
             noise=self.noise,
         )
+        x_t, pad_mask_t, orig_idx = _bfs_canonicalize_batch_with_orig_idx(x_t, pad_mask_t, k=self.k)
 
         # Model mask: padding or inactive
         mask = pad_mask_t | (x_t[:, :, 2] == 0)
@@ -121,13 +193,26 @@ class TreeEditDFM(nn.Module):
         rates, ins_logits, sub_logits = self.net(x_t, mask, t)
 
         current_slots = build_child_slot_types(x_t, pad_mask_t, k=self.k)
-        target_slots = build_child_slot_types(x1, pad_mask, k=self.k)
+        # target slots computed on original x1 index space
+        target_slots_full = build_child_slot_types(x1, pad_mask, k=self.k)   # [B,N_orig,K]
+
+        # gather target slots for canonical parents using orig_idx
+        B, Nc, _ = x_t.shape
+        orig_clamped = orig_idx.clamp(min=0, max=target_slots_full.size(1) - 1)  # [B,Nc]
+        target_slots = target_slots_full.gather(
+            1, orig_clamped.unsqueeze(-1).expand(B, Nc, self.k)
+        )  # [B,Nc,K]
+        target_slots = torch.where(
+            (orig_idx < 0).unsqueeze(-1) | pad_mask_t.unsqueeze(-1),
+            torch.zeros_like(target_slots),
+            target_slots,
+        )
 
         # psi per parent (depth+1)
         parent_depths = x_t[:, :, 0].clamp(min=0, max=self.max_depth).long()
         child_depths = (parent_depths + 1).clamp(max=self.max_depth).long()
         psi_parent = self.scheduler.psi(t, child_depths)  # [B,N]
-        psi = psi_parent.unsqueeze(-1).expand(B, N, self.k)
+        psi = psi_parent.unsqueeze(-1).expand(B, Nc, self.k)
 
         parent_active = (~pad_mask_t) & (x_t[:, :, 2] > 0)
         if parent_active.sum() == 0:
@@ -143,6 +228,13 @@ class TreeEditDFM(nn.Module):
         psi_s = psi[parent_active]
 
         loss = self.loss_fn(rates_s, ins_s, sub_s, cur_s, tgt_s, psi_s)
+
+        print('[DEBUG] : t =', t)
+        print('[DEBUG] : Proportion of mismatched nodes =', (cur_s != tgt_s).float().mean().item())
+        print('[DEBUG] : Current slots =', cur_s)
+        print('[DEBUG] : Target slots =', tgt_s)
+        print('[DEBUG] : PSI =', psi_s)
+        print('[DEBUG] : Lam_ins =', ins_s)
 
         with torch.no_grad():
             nodes_xt = float(((~pad_mask_t) & (x_t[:, :, 2] > 0)).sum(dim=1).float().mean().item())

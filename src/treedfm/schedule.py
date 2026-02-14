@@ -112,6 +112,8 @@ class ProfiledDepthSchedule:
         starts: torch.Tensor,
         widths: torch.Tensor,
         max_psi: float = 200.0,
+        mode: str = "linear",   # "linear" (default) or "exp"
+        exp_eps: float = 1e-3,  # exp mode: kappa reaches ~1-exp_eps at window end (before clamp)
     ):
         if starts.dim() != 1 or widths.dim() != 1 or starts.numel() != widths.numel():
             raise ValueError("starts/widths must be 1D tensors of the same length")
@@ -122,6 +124,12 @@ class ProfiledDepthSchedule:
         self.widths = widths.detach().float().clone()  # [D+1]
         self.max_depth = int(self.starts.numel() - 1)
         self.max_psi = float(max_psi)
+        if mode not in ("linear", "exp"):
+            raise ValueError(f"Unknown mode: {mode} (expected 'linear' or 'exp')")
+        self.mode = mode
+        self.exp_eps = float(exp_eps)
+        if not (0.0 < self.exp_eps < 1.0):
+            raise ValueError("exp_eps must be in (0,1)")
 
     def _gather(self, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather start/width per depth index and broadcast to `depths` shape."""
@@ -137,8 +145,25 @@ class ProfiledDepthSchedule:
         # Broadcast t to match depths
         t_b = t.to(depths.device).view(-1, *([1] * (depths.dim() - 1))).expand_as(depths).float()
         s, w = self._gather(depths)
-        progress = (t_b - s) / w
-        return torch.clamp(progress, 0.0, 1.0)
+        if self.mode == "linear":
+            progress = (t_b - s) / w
+            return torch.clamp(progress, 0.0, 1.0)
+
+        # exp mode: constant-hazard ramp inside [s, s+w), clamp to 1 afterwards.
+        dt = t_b - s
+        before = dt < 0
+        after = dt >= w
+        in_window = (~before) & (~after)
+
+        log_inv_eps = torch.log(torch.tensor(1.0 / self.exp_eps, device=depths.device, dtype=torch.float32))
+        beta = log_inv_eps / torch.clamp(w, min=1e-6)   # hazard
+        beta = torch.clamp(beta, max=self.max_psi)
+
+        k_win = 1.0 - torch.exp(-beta * torch.clamp(dt, min=0.0))
+        k = torch.zeros_like(dt)
+        k = torch.where(in_window, k_win, k)
+        k = torch.where(after, torch.ones_like(k), k)
+        return k
 
     def psi(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
         if t.dim() != 1:
@@ -148,13 +173,20 @@ class ProfiledDepthSchedule:
         t_end = s + w
         in_window = (t_b >= s) & (t_b < t_end)
 
-        kappa = self.kappa(t, depths)
-        denom = torch.clamp(1.0 - kappa, min=1e-6)
-        kdot = (1.0 / w) * in_window.float()
-        psi = kdot / denom
-        psi = torch.clamp(psi, 0.0, self.max_psi)
-        psi = psi * in_window.float()
-        return psi
+        if self.mode == "linear":
+            kappa = self.kappa(t, depths)
+            denom = torch.clamp(1.0 - kappa, min=1e-6)
+            kdot = (1.0 / w) * in_window.float()
+            psi = kdot / denom
+            psi = torch.clamp(psi, 0.0, self.max_psi)
+            psi = psi * in_window.float()
+            return psi
+
+        # exp mode: psi is constant hazard beta inside the window
+        log_inv_eps = torch.log(torch.tensor(1.0 / self.exp_eps, device=depths.device, dtype=torch.float32))
+        beta = log_inv_eps / torch.clamp(w, min=1e-6)
+        beta = torch.clamp(beta, max=self.max_psi)
+        return beta * in_window.float()
 
     def kappa_and_psi(self, t: torch.Tensor, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.kappa(t, depths), self.psi(t, depths)
@@ -243,6 +275,8 @@ def make_profiled_sequential_schedule(
     t1: float = 1.0,
     include_root: bool = False,
     overlap: float = 0.0,
+    mode: str = "linear",
+    exp_eps: float = 1e-3,
 ) -> ProfiledDepthSchedule:
     """Build a *sequential* depth schedule from a depth profile.
 
@@ -295,6 +329,18 @@ def make_profiled_sequential_schedule(
     sched_mask = torch.ones_like(counts, dtype=torch.bool)
     if not include_root:
         sched_mask[0] = False
+
+    # ---- NEW: trim depths beyond the last depth that actually appears in the dataset ----
+    # If we don't do this, profiled schedules can waste time budget on depths that never occur,
+    # shrinking early-depth windows (depth 1/2) and making insertion learning too rare.
+    raw = counts.clone()
+    if not include_root:
+        raw[0] = 0.0
+    nz = torch.nonzero(raw > 0, as_tuple=False)
+    if nz.numel() > 0:
+        last = int(nz[-1].item())
+        # deactivate depths > last
+        sched_mask[(last + 1):] = False
 
     # Smoothing + tempering
     w = torch.zeros_like(counts)
@@ -350,4 +396,4 @@ def make_profiled_sequential_schedule(
         starts[0] = float(t0)
         widths[0] = float(min_width)
 
-    return ProfiledDepthSchedule(starts=starts, widths=widths, max_psi=max_psi)
+    return ProfiledDepthSchedule(starts=starts, widths=widths, max_psi=max_psi, mode=mode, exp_eps=exp_eps)

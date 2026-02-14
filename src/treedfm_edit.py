@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--profile_power", type=float, default=1.0)
     parser.add_argument("--profile_min_width", type=float, default=1e-3)
     parser.add_argument("--profile_overlap", type=float, default=0.0)
+    parser.add_argument("--profile_mode", type=str, default="linear", choices=["linear", "exp"])
+    parser.add_argument("--profile_exp_eps", type=float, default=1e-3)
 
     # Noise
     parser.add_argument("--p_blank_token", type=float, default=0.9)
@@ -129,6 +131,8 @@ def main():
             max_psi=args.schedule_max_psi,
             include_root=False,
             overlap=args.profile_overlap,
+            mode=args.profile_mode,
+            exp_eps=args.profile_exp_eps,
         )
         print("[info] Using profiled sequential schedule.")
         print("       depth mass (top 10 depths):", profile.counts[:10].tolist())
@@ -148,6 +152,7 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         dropout=args.dropout,
+        scheduler=scheduler,
     ).to(args.device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)

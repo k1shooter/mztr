@@ -91,11 +91,16 @@ def corrupt_batch_tree(
     z0_type = _rand_token_like((B, N), num_types=num_types, device=device)
     # Optionally avoid "substitution identity" where z0 == z1
     if noise.avoid_substitution_identity:
+        # same = (z0_type == types_1) & (types_1 > 0)
+        # if same.any():
+        #     # resample once; if still same it's ok (rare)
+        #     z0_type2 = _rand_token_like((B, N), num_types=num_types, device=device)
+        #     z0_type = torch.where(same, z0_type2, z0_type)
         same = (z0_type == types_1) & (types_1 > 0)
-        if same.any():
-            # resample once; if still same it's ok (rare)
-            z0_type2 = _rand_token_like((B, N), num_types=num_types, device=device)
-            z0_type = torch.where(same, z0_type2, z0_type)
+        while same.any():
+            z0_new = _rand_token_like((B, N), num_types=num_types, device=device)
+            z0_type = torch.where(same, z0_new, z0_type)
+            same = (z0_type == types_1) & (types_1 > 0)
 
     z0 = torch.where(z0_blank, torch.zeros_like(z0_type), z0_type)
     # Padding and root handling

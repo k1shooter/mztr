@@ -24,6 +24,30 @@ def _build_child_index(tree: List[List[int]], k: int) -> Dict[Tuple[int, int], i
         mapping[(int(parent), int(rank))] = idx
     return mapping
 
+def _bfs_canonicalize_active(tree: List[List[int]], k: int) -> List[List[int]]:
+    """
+    Canonicalize a tree to BFS order (like training data) and reindex parent_idx.
+    Keeps only active nodes (type!=0) reachable from root.
+    """
+    if not tree:
+        return []
+    child_map = _build_child_index(tree, k=k)
+    clean: List[List[int]] = []
+    queue: List[Tuple[int, int]] = [(0, -1)]  # (old_idx, new_parent_idx)
+    while queue:
+        old, new_parent = queue.pop(0)
+        if old >= len(tree):
+            continue
+        depth, rank, typ, _parent = tree[old]
+        if int(typ) == 0:
+            continue
+        new_idx = len(clean)
+        clean.append([int(depth), int(rank), int(typ), int(new_parent)])
+        for r in range(k):
+            c = child_map.get((old, r))
+            if c is not None:
+                queue.append((c, new_idx))
+    return clean
 
 def _cascade_delete(tree: List[List[int]], node_idx: int, child_map: Dict[Tuple[int, int], int], k: int) -> None:
     """
@@ -67,6 +91,8 @@ def sample_tree_ctmc(
     for s in range(steps):
         t_val = float(s) * dt
         t_tensor = torch.full((num_samples,), t_val, device=device)
+        # NEW: match training coordinate system (BFS order) to reduce pos_emb mismatch
+        trees = [_bfs_canonicalize_active(t, k=k) for t in trees]
 
         # Convert variable-length trees into padded tensor
         feats = [torch.tensor(t, dtype=torch.long) for t in trees]
@@ -139,27 +165,27 @@ def sample_tree_ctmc(
                             else:
                                 new_type = int(torch.multinomial(sub_probs[b, parent_idx, r], 1).item()) + 1
                                 tree[c_idx][2] = new_type
+    return [_bfs_canonicalize_active(t, k=k) for t in trees]
+    # # Final cleanup: keep only connected active nodes in BFS from root.
+    # final_trees: List[List[List[int]]] = []
+    # for tree in trees:
+    #     # Rebuild child map for traversal
+    #     child_map = _build_child_index(tree, k=k)
+    #     clean: List[List[int]] = []
+    #     queue = [(0, -1)]  # old_idx, new_parent
+    #     while queue:
+    #         old, new_parent = queue.pop(0)
+    #         if old >= len(tree):
+    #             continue
+    #         node = tree[old]
+    #         if node[2] == 0:
+    #             continue
+    #         new_idx = len(clean)
+    #         clean.append([int(node[0]), int(node[1]), int(node[2]), int(new_parent)])
+    #         for r in range(k):
+    #             c = child_map.get((old, r))
+    #             if c is not None:
+    #                 queue.append((c, new_idx))
+    #     final_trees.append(clean)
 
-    # Final cleanup: keep only connected active nodes in BFS from root.
-    final_trees: List[List[List[int]]] = []
-    for tree in trees:
-        # Rebuild child map for traversal
-        child_map = _build_child_index(tree, k=k)
-        clean: List[List[int]] = []
-        queue = [(0, -1)]  # old_idx, new_parent
-        while queue:
-            old, new_parent = queue.pop(0)
-            if old >= len(tree):
-                continue
-            node = tree[old]
-            if node[2] == 0:
-                continue
-            new_idx = len(clean)
-            clean.append([int(node[0]), int(node[1]), int(node[2]), int(new_parent)])
-            for r in range(k):
-                c = child_map.get((old, r))
-                if c is not None:
-                    queue.append((c, new_idx))
-        final_trees.append(clean)
-
-    return final_trees
+    # return final_trees

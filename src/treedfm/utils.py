@@ -34,12 +34,12 @@ def pad_sequence(
                              f"Increase pad_to or check inputs.")
         pad_n = max_len - n
         if pad_n > 0:
-            pad = torch.full((pad_n, d), padding_value, dtype=x.dtype)
+            pad = torch.full((pad_n, d), padding_value, dtype=x.dtype, device=x.device)
             x_padded = torch.cat([x, pad], dim=0)
         else:
             x_padded = x
 
-        mask = torch.zeros(max_len, dtype=torch.bool)
+        mask = torch.zeros(max_len, dtype=torch.bool, device=x.device)
         if pad_n > 0:
             mask[n:] = True
         padded.append(x_padded)
