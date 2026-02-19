@@ -86,7 +86,7 @@ def create_dummy_dataset(num_samples=50, max_depth=20, k=3):
 # ==========================================
 # 4. Visualization Logic
 # ==========================================
-def visualize_treedfm_profiled(pkl_filename="maze_trees_relative_44.pkl", output_gif="treedfm_profiled_flow.gif", steps=100):
+def visualize_treedfm_profiled(pkl_filename="maze_trees_relative.pkl", output_gif="treedfm_profiled_flow.gif", steps=100):
     print(f"Initializing Profiled TreeDFM Visualization...")
     
     # Config

@@ -208,11 +208,30 @@ class TreeEditDFM(nn.Module):
             target_slots,
         )
 
-        # psi per parent (depth+1)
+        ## psi per parent (depth+1)
+        # ---- psi scheduling (optionally op-specific) ----
+        # Convention: depth is the *child* depth (parent depth + 1) because edits are on child slots.
         parent_depths = x_t[:, :, 0].clamp(min=0, max=self.max_depth).long()
         child_depths = (parent_depths + 1).clamp(max=self.max_depth).long()
-        psi_parent = self.scheduler.psi(t, child_depths)  # [B,N]
-        psi = psi_parent.unsqueeze(-1).expand(B, Nc, self.k)
+        # psi_parent = self.scheduler.psi(t, child_depths)  # [B,N]
+        # psi = psi_parent.unsqueeze(-1).expand(B, Nc, self.k)
+        #####################################################################################################################
+        # Allow the schedule to provide operation-specific psi.
+        #   - insertion & deletion: existence schedule
+        #   - substitution: type schedule
+        if hasattr(self.scheduler, "psi_ops"):
+            psi_ins_p, psi_del_p, psi_sub_p = self.scheduler.psi_ops(t, child_depths)
+        else:
+            # Backward compatible fallback
+            psi_exist = self.scheduler.psi(t, child_depths)
+            psi_ins_p, psi_del_p, psi_sub_p = psi_exist, psi_exist, psi_exist
+
+        psi_ins = psi_ins_p.unsqueeze(-1).expand(B, N, self.k)
+        psi_del = psi_del_p.unsqueeze(-1).expand(B, N, self.k)
+        psi_sub = psi_sub_p.unsqueeze(-1).expand(B, N, self.k)
+        # shape: [B, N, K, 3]
+        psi = torch.stack([psi_ins, psi_del, psi_sub], dim=-1)
+        #####################################################################################################################
 
         parent_active = (~pad_mask_t) & (x_t[:, :, 2] > 0)
         if parent_active.sum() == 0:
@@ -228,14 +247,6 @@ class TreeEditDFM(nn.Module):
         psi_s = psi[parent_active]
 
         loss = self.loss_fn(rates_s, ins_s, sub_s, cur_s, tgt_s, psi_s)
-
-        print('[DEBUG] : t =', t)
-        print('[DEBUG] : Proportion of mismatched nodes =', (cur_s != tgt_s).float().mean().item())
-        print('[DEBUG] : Current slots =', cur_s)
-        print('[DEBUG] : Target slots =', tgt_s)
-        print('[DEBUG] : PSI =', psi_s)
-        print('[DEBUG] : Lam_ins =', ins_s)
-
         with torch.no_grad():
             nodes_xt = float(((~pad_mask_t) & (x_t[:, :, 2] > 0)).sum(dim=1).float().mean().item())
             nodes_x1 = float(((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean().item())

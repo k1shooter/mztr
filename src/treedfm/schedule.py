@@ -45,6 +45,11 @@ class DepthStratifiedSchedule:
         psi(t,d) = kappa_dot / (1 - kappa)
         with kappa_dot = 1/width in the active window and 0 outside.
         We clip psi to max_psi for numerical stability.
+
+        NOTE: clipping psi breaks the identity psi = kappa_dot/(1-kappa) unless you
+            also change kappa accordingly. In practice this can destabilize learning
+            near the end of the ramp (kappa -> 1). Prefer an exponential-ramp schedule
+            (ExpProfiledDepthSchedule) which keeps psi bounded *by construction*.
         """
         if t.dim() != 1:
             raise ValueError("t must be shape [B]")
@@ -191,6 +196,45 @@ class ProfiledDepthSchedule:
     def kappa_and_psi(self, t: torch.Tensor, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.kappa(t, depths), self.psi(t, depths)
 
+class SplitKappaSchedule:
+    """Wrap two schedules: one for existence (blank vs token), one for type correctness.
+
+    This is a small utility so you can keep the rest of the code mostly unchanged.
+
+    - kappa()/psi() are aliased to the *existence* schedule for backward compat.
+    - kappa_exist/psi_exist and kappa_type/psi_type are exposed explicitly.
+    """
+
+    def __init__(self, exist: TreeSchedule, typ: TreeSchedule | None = None):
+        self.exist = exist
+        self.typ = typ if typ is not None else exist
+        self.max_depth = int(getattr(exist, "max_depth", 128))
+
+    # Back-compat
+    def kappa(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.exist.kappa(t, depths)
+
+    def psi(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.exist.psi(t, depths)
+
+    # Explicit split
+    def kappa_exist(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.exist.kappa(t, depths)
+
+    def psi_exist(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.exist.psi(t, depths)
+
+    def kappa_type(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.typ.kappa(t, depths)
+
+    def psi_type(self, t: torch.Tensor, depths: torch.Tensor) -> torch.Tensor:
+        return self.typ.psi(t, depths)
+
+    def psi_ops(self, t: torch.Tensor, depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(psi_ins, psi_del, psi_sub) at (t,depth). Default: ins/del use exist, sub uses type."""
+        psi_e = self.psi_exist(t, depths)
+        psi_y = self.psi_type(t, depths)
+        return psi_e, psi_e, psi_y
 
 CountMode = Literal["nodes", "all_slots"]
 

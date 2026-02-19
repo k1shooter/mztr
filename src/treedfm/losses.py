@@ -25,6 +25,9 @@ class PermutationEditFlowLoss(nn.Module):
 
     Schedule:
       - psi: [M, K] (kappa_dot/(1-kappa)) or any positive weight
+      either
+          * [M, K]        : same weight for all ops (backward compatible)
+          * [M, K, 3]     : op-specific weights (psi_ins, psi_del, psi_sub)
 
     Loss per slot:
       outgoing =  { lambda_ins                  if current==0
@@ -56,7 +59,7 @@ class PermutationEditFlowLoss(nn.Module):
         sub_logits: torch.Tensor,  # [M, K, C]
         current: torch.Tensor,     # [M, K]
         target: torch.Tensor,      # [M, K]
-        psi: torch.Tensor,         # [M, K]
+        psi: torch.Tensor,         # [M,K] or [M,K,3]
     ) -> torch.Tensor:
         M, K, _ = rates.shape
         C = ins_logits.size(-1)
@@ -67,10 +70,26 @@ class PermutationEditFlowLoss(nn.Module):
         lam_sub = rates[..., 2].clamp_min(0.0)
 
         ins_probs = F.softmax(ins_logits, dim=-1)  # [M,K,C]
-        sub_probs = F.softmax(sub_logits, dim=-1)
+        #sub_probs = F.softmax(sub_logits, dim=-1)
+        
+        # Align substitution distribution with the sampler: a "substitution" event
+        # should actually change the token, so we forbid sampling the current token.
 
         cur0 = (current == 0)
         cur1 = (current > 0)
+
+        #####################################################################################################################
+        if cur1.any():
+            tok_idx = (current - 1).clamp(min=0, max=C - 1)  # [M,K]
+            masked = sub_logits.clone()
+            flat = masked.view(-1, C)
+            tok_idx_f = tok_idx.view(-1)
+            cur1_f = cur1.view(-1)
+            flat[cur1_f, tok_idx_f[cur1_f]] = float("-inf")
+            sub_probs = F.softmax(masked, dim=-1)
+        else:
+            sub_probs = F.softmax(sub_logits, dim=-1)
+        #####################################################################################################################
 
         outgoing = torch.zeros((M, K), device=rates.device, dtype=rates.dtype)
         outgoing[cur0] = lam_ins[cur0]
@@ -99,14 +118,36 @@ class PermutationEditFlowLoss(nn.Module):
             probs = sub_probs[mask_sub].gather(-1, tgt_idx.unsqueeze(-1)).squeeze(-1)
             correct_rate[mask_sub] = lam_sub[mask_sub] * probs
 
-        mismatch = (target != current)
-        # If mismatch but operation would be illegal (e.g., cur=0 & tgt=0) this is False anyway.
-        # Here mismatch includes (cur>0 & tgt>0 same) False.
-        # For mismatch positions, apply reward term.
+        # mismatch = (target != current)
+        # # If mismatch but operation would be illegal (e.g., cur=0 & tgt=0) this is False anyway.
+        # # Here mismatch includes (cur>0 & tgt>0 same) False.
+        # # For mismatch positions, apply reward term.
+        #####################################################################################################################
+        # --- psi handling ---
+        if psi.dim() == 2:
+            psi_ins = psi
+            psi_del = psi
+            psi_sub = psi
+        elif psi.dim() == 3 and psi.size(-1) == 3:
+            psi_ins = psi[..., 0]
+            psi_del = psi[..., 1]
+            psi_sub = psi[..., 2]
+        else:
+            raise ValueError(f"psi must be [M,K] or [M,K,3], got {tuple(psi.shape)}")
+        #####################################################################################################################
         loss = outgoing
-        if mismatch.any():
-            safe_rate = correct_rate.clamp_min(self.eps)
-            loss = loss - psi * mismatch.float() * torch.log(safe_rate)
+        # if mismatch.any():
+        #     safe_rate = correct_rate.clamp_min(self.eps)
+        #     loss = loss - psi * mismatch.float() * torch.log(safe_rate)
+        #####################################################################################################################
+        safe_rate = correct_rate.clamp_min(self.eps)
+        if mask_ins.any():
+            loss[mask_ins] = loss[mask_ins] - psi_ins[mask_ins] * torch.log(safe_rate[mask_ins])
+        if mask_del.any():
+            loss[mask_del] = loss[mask_del] - psi_del[mask_del] * torch.log(safe_rate[mask_del])
+        if mask_sub.any():
+            loss[mask_sub] = loss[mask_sub] - psi_sub[mask_sub] * torch.log(safe_rate[mask_sub])
+        #####################################################################################################################
 
         return loss  # [M,K]
 
@@ -127,8 +168,12 @@ class PermutationEditFlowLoss(nn.Module):
         M, K, _ = rates.shape
         if K != self.k:
             raise ValueError(f"K mismatch: expected {self.k}, got {K}")
-        if current.shape != (M, K) or target.shape != (M, K) or psi.shape != (M, K):
-            raise ValueError("current/target/psi must be [M,K] matching rates")
+        # if current.shape != (M, K) or target.shape != (M, K) or psi.shape != (M, K):
+        #     raise ValueError("current/target/psi must be [M,K] matching rates")
+        if current.shape != (M, K) or target.shape != (M, K):
+            raise ValueError("current/target must be [M,K] matching rates")
+        if psi.shape not in {(M, K), (M, K, 3)}:
+            raise ValueError("psi must be [M,K] or [M,K,3] matching rates")
 
         if not self.permutation_invariant:
             loss = self._slot_loss(rates, ins_logits, sub_logits, current, target, psi)  # [M,K]
@@ -143,7 +188,11 @@ class PermutationEditFlowLoss(nn.Module):
         ins_e = ins_logits.unsqueeze(1).expand(M, P, K, self.num_types)
         sub_e = sub_logits.unsqueeze(1).expand(M, P, K, self.num_types)
         cur_e = current.unsqueeze(1).expand(M, P, K)
-        psi_e = psi.unsqueeze(1).expand(M, P, K)
+        #psi_e = psi.unsqueeze(1).expand(M, P, K)
+        if psi.dim() == 2:
+            psi_e = psi.unsqueeze(1).expand(M, P, K)
+        else:
+            psi_e = psi.unsqueeze(1).expand(M, P, K, 3)
 
         # Compute loss per perm
         # We'll vectorize by reshaping (M*P, K, ...)
@@ -154,7 +203,8 @@ class PermutationEditFlowLoss(nn.Module):
             sub_e.reshape(MP, K, self.num_types),
             cur_e.reshape(MP, K),
             target_perm.reshape(MP, K),
-            psi_e.reshape(MP, K),
+            #psi_e.reshape(MP, K),
+            psi_e.reshape(MP, K) if psi.dim() == 2 else psi_e.reshape(MP, K, 3),
         )  # [MP,K]
         loss_perm = loss_slot.sum(dim=-1).reshape(M, P)  # [M,P]
         min_loss, _ = torch.min(loss_perm, dim=-1)  # [M]
