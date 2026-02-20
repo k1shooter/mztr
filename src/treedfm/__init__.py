@@ -9,10 +9,11 @@ Public API (minimal):
 """
 
 from .data import MazeTreeDataset, collate_tree_batch
-from .dfm import TreeEditDFM
+from .dfm import TreeEditDFM, TreeInsertOnlyDFM
 
 __all__ = [
     "MazeTreeDataset",
     "collate_tree_batch",
     "TreeEditDFM",
+    "TreeInsertOnlyDFM",
 ]

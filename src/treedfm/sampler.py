@@ -114,6 +114,16 @@ def sample_tree_ctmc(
         lam_del = rates[..., 1].clamp_min(0.0)
         lam_sub = rates[..., 2].clamp_min(0.0)
 
+        # NOTE: The event simulation below is Python-loop heavy. If we call `.item()` on CUDA
+        # tensors inside those loops, we force a GPU sync thousands of times per sampling step.
+        # To keep sampling fast (and avoid stalling training when you sample every few epochs),
+        # move the small tensors to CPU once per step.
+        ins_probs = ins_probs.cpu()
+        sub_probs = sub_probs.cpu()
+        lam_ins = lam_ins.cpu()
+        lam_del = lam_del.cpu()
+        lam_sub = lam_sub.cpu()
+
         for b in range(num_samples):
             tree = trees[b]
             if len(tree) >= max_nodes:

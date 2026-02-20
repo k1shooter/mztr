@@ -337,3 +337,71 @@ def corrupt_batch_tree(
 
 
     return x_t, pad_mask_t
+
+def corrupt_batch_tree_insert_only(
+    x1: torch.Tensor,
+    pad_mask: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    k: int,
+    num_types: int,
+    scheduler: DepthStratifiedSchedule,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Insert-only corruption (ablation #1).
+
+    This matches the *early* insert-only setup:
+      - only *blanking* (type -> 0) is applied (no random token noise, no spurious injection)
+      - types of surviving nodes remain equal to the target
+      - projection enforces tree closure: if parent is absent, child is forced absent
+
+    Parameters are kept similar to `corrupt_batch_tree` for easy swapping.
+    `num_types` is unused here but kept for signature compatibility.
+    """
+    if x1.dim() != 3 or x1.size(-1) != 4:
+        raise ValueError(f"corrupt_batch_tree_insert_only: expected x1 [B,N,4], got {tuple(x1.shape)}")
+    B, N, _ = x1.shape
+    device = x1.device
+
+    x_t = x1.clone()
+    pad_mask_t = pad_mask.clone()
+
+    depths = x1[:, :, 0].clone()
+    types_1 = x1[:, :, 2].clone()
+    parents = x1[:, :, 3].clone()
+
+    is_pad = pad_mask
+    is_root = (parents < 0) & (~is_pad)
+    is_token = (types_1 > 0) & (~is_pad)
+
+    # Depth-aware keep probability (existence schedule). If split schedule exists, use it.
+    if hasattr(scheduler, "kappa_exist"):
+        kappa = scheduler.kappa_exist(t, depths)
+    else:
+        kappa = scheduler.kappa(t, depths)
+
+    u = torch.rand((B, N), device=device)
+    keep = (u < kappa) & is_token
+    keep = keep | is_root  # root always kept
+
+    types_t = torch.where(keep, types_1, torch.zeros_like(types_1))
+    types_t = torch.where(is_pad, torch.zeros_like(types_t), types_t)
+    x_t[:, :, 2] = types_t
+
+    # Projection: if parent absent then child absent.
+    safe_parents = parents.clone()
+    safe_parents = torch.where(safe_parents < 0, torch.zeros_like(safe_parents), safe_parents)
+
+    exist = (x_t[:, :, 2] > 0) & (~pad_mask_t)
+    exist = exist.clone()
+    exist[:, 0] = True  # root exists
+
+    for _ in range(int(getattr(scheduler, "max_depth", 128)) + 2):
+        parent_exist = exist.gather(1, safe_parents.clamp(0, N - 1))
+        has_parent = (parents >= 0) & (~pad_mask_t)
+        new_exist = exist & (~has_parent | parent_exist)
+        if torch.equal(new_exist, exist):
+            break
+        exist = new_exist
+
+    x_t[:, :, 2] = torch.where(exist, x_t[:, :, 2], torch.zeros_like(x_t[:, :, 2]))
+    return x_t, pad_mask_t

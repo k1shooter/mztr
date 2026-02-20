@@ -8,84 +8,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .corruption import NoiseConfig, corrupt_batch_tree
+from .corruption import NoiseConfig, corrupt_batch_tree, corrupt_batch_tree_insert_only
 from .losses import PermutationEditFlowLoss
 from .model import TreeEditTransformer
 from .schedule import DepthStratifiedSchedule, ProfiledDepthSchedule
-from .utils import build_child_slot_types, TreeUtils, pad_sequence
+from .utils import build_child_slot_types, TreeUtils, pad_sequence, canonicalize_bfs_with_orig_idx
 from .sampler import sample_tree_ctmc
 
-def _bfs_canonicalize_batch_with_orig_idx(x: torch.Tensor, pad_mask: torch.Tensor, k: int):
-    """
-    x: [B,N,4], pad_mask: [B,N]
-    returns:
-      x_can: [B,Nc,4]  (active-only BFS order, parent_idx remapped)
-      pad_can: [B,Nc]
-      orig_idx: [B,Nc]  (new node -> old index in x (== index in x1); pad rows are -1)
-    """
-    B, N, _ = x.shape
-    device = x.device
 
-    x_list = []
-    orig_list = []
-
-    for b in range(B):
-        xb = x[b]
-        pb = pad_mask[b]
-
-        # Build child map (parent_idx, rank) -> child_idx (old indices)
-        child_map = {}
-        parents = xb[:, 3].tolist()
-        ranks = xb[:, 1].tolist()
-        types = xb[:, 2].tolist()
-
-        for idx in range(N):
-            if bool(pb[idx]):
-                continue
-            p = int(parents[idx])
-            if p < 0:
-                continue
-            r = int(ranks[idx])
-            if 0 <= r < k:
-                child_map[(p, r)] = idx
-
-        clean = []
-        orig = []
-        queue = [(0, -1)]  # (old_idx, new_parent_idx)
-
-        while queue:
-            old, new_parent = queue.pop(0)
-            if old < 0 or old >= N:
-                continue
-            if bool(pb[old]):
-                continue
-            if int(types[old]) == 0:
-                continue
-
-            new_idx = len(clean)
-            depth = int(xb[old, 0].item())
-            rank = int(xb[old, 1].item())
-            typ  = int(xb[old, 2].item())
-            clean.append([depth, rank, typ, int(new_parent)])
-            orig.append(int(old))
-
-            for r in range(k):
-                c = child_map.get((old, r))
-                if c is not None:
-                    queue.append((c, new_idx))
-
-        # safety (shouldn't happen because root is forced to exist)
-        if len(clean) == 0:
-            clean = [[0, 0, 0, -1]]
-            orig = [-1]
-
-        x_list.append(torch.tensor(clean, dtype=torch.long, device=device))
-        orig_list.append(torch.tensor(orig, dtype=torch.long, device=device))
-
-    x_can, pad_can = pad_sequence(x_list, padding_value=0, pad_to=None)
-    orig_can, _ = pad_sequence([o.unsqueeze(1) for o in orig_list], padding_value=-1, pad_to=x_can.size(1))
-    orig_can = orig_can.squeeze(-1)
-    return x_can.to(device), pad_can.to(device), orig_can.to(device)
 
 class TreeEditDFM(nn.Module):
     """
@@ -185,7 +115,7 @@ class TreeEditDFM(nn.Module):
             scheduler=self.scheduler,
             noise=self.noise,
         )
-        x_t, pad_mask_t, orig_idx = _bfs_canonicalize_batch_with_orig_idx(x_t, pad_mask_t, k=self.k)
+        x_t, pad_mask_t, orig_idx = canonicalize_bfs_with_orig_idx(x_t, pad_mask_t, k=self.k)
 
         # Model mask: padding or inactive
         mask = pad_mask_t | (x_t[:, :, 2] == 0)
@@ -226,9 +156,9 @@ class TreeEditDFM(nn.Module):
             psi_exist = self.scheduler.psi(t, child_depths)
             psi_ins_p, psi_del_p, psi_sub_p = psi_exist, psi_exist, psi_exist
 
-        psi_ins = psi_ins_p.unsqueeze(-1).expand(B, N, self.k)
-        psi_del = psi_del_p.unsqueeze(-1).expand(B, N, self.k)
-        psi_sub = psi_sub_p.unsqueeze(-1).expand(B, N, self.k)
+        psi_ins = psi_ins_p.unsqueeze(-1).expand(B, Nc, self.k)
+        psi_del = psi_del_p.unsqueeze(-1).expand(B, Nc, self.k)
+        psi_sub = psi_sub_p.unsqueeze(-1).expand(B, Nc, self.k)
         # shape: [B, N, K, 3]
         psi = torch.stack([psi_ins, psi_del, psi_sub], dim=-1)
         #####################################################################################################################
@@ -236,7 +166,8 @@ class TreeEditDFM(nn.Module):
         parent_active = (~pad_mask_t) & (x_t[:, :, 2] > 0)
         if parent_active.sum() == 0:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
-            return loss, {"nodes_xt": 0.0, "nodes_x1": float(((~pad_mask)&(x1[:,:,2]>0)).sum().item()/B)}
+            nodes_x1 = ((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean()
+            return loss, {"nodes_xt": torch.zeros((), device=device), "nodes_x1": nodes_x1}
 
         # Slice to active parents
         rates_s = rates[parent_active]
@@ -248,8 +179,8 @@ class TreeEditDFM(nn.Module):
 
         loss = self.loss_fn(rates_s, ins_s, sub_s, cur_s, tgt_s, psi_s)
         with torch.no_grad():
-            nodes_xt = float(((~pad_mask_t) & (x_t[:, :, 2] > 0)).sum(dim=1).float().mean().item())
-            nodes_x1 = float(((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean().item())
+            nodes_xt = ((~pad_mask_t) & (x_t[:, :, 2] > 0)).sum(dim=1).float().mean()
+            nodes_x1 = ((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean()
 
         return loss, {"nodes_xt": nodes_xt, "nodes_x1": nodes_x1}
 
@@ -276,3 +207,173 @@ class TreeEditDFM(nn.Module):
         for i, tree in enumerate(trees):
             fn = os.path.join(save_dir, f"epoch_{epoch:04d}_sample_{i}.png")
             TreeUtils.save_tree_plot(tree, fn, title=f"epoch {epoch} | sample {i} | nodes={len(tree)}")
+
+class TreeInsertOnlyDFM(nn.Module):
+    """Insert-only ablation model (same backbone / size as TreeEditDFM).
+
+    Differences vs TreeEditDFM:
+      - corruption: only *blank out* target nodes (no random-token noise, no spurious nodes)
+      - operations: only insertion is enabled (delete/sub rates are forced to 0)
+      - loss: still uses the same EditFlow-style objective, but only insertion terms are active
+
+    This isolates how much the EDIT operations (del/sub) are helping vs a pure growth process.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_types: int = 3,
+        k: int = 3,
+        max_depth: int = 100,
+        max_nodes: int = 256,
+        schedule_width: float = 0.5,
+        schedule_max_psi: float = 200.0,
+        # keep the same signature for easy ablation swapping
+        p_blank_when_target_token: float = 0.9,
+        p_blank_when_target_blank: float = 0.98,
+        max_spurious_per_tree: int = 64,
+        avoid_substitution_identity: bool = True,
+        permutation_invariant: bool = True,
+        root_type: int = 2,
+        d_model: int = 384,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        dropout: float = 0.1,
+        scheduler: Optional[object] = None,
+    ):
+        super().__init__()
+        self.num_types = int(num_types)
+        self.k = int(k)
+        self.max_depth = int(max_depth)
+        self.max_nodes = int(max_nodes)
+        self.root_type = int(root_type)
+
+        # Schedule object: same API as TreeEditDFM expects.
+        if scheduler is None:
+            self.scheduler = DepthStratifiedSchedule(
+                max_depth=max_depth,
+                width=schedule_width,
+                max_psi=schedule_max_psi,
+            )
+        else:
+            self.scheduler = scheduler
+
+        # Backbone identical to TreeEditDFM (same size)
+        self.net = TreeEditTransformer(
+            num_types=num_types,
+            k=k,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dropout=dropout,
+        )
+
+        # We can reuse the same loss implementation; del/sub will be disabled.
+        self.loss_fn = PermutationEditFlowLoss(
+            k=k,
+            num_types=num_types,
+            permutation_invariant=permutation_invariant,
+        )
+
+    def forward(self, x_t: torch.Tensor, mask: torch.Tensor, t: torch.Tensor):
+        return self.net(x_t, mask, t)
+
+    def loss_on_batch(self, x1: torch.Tensor, pad_mask: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        device = x1.device
+        B, N, _ = x1.shape
+
+        t = torch.rand((B,), device=device)
+
+        # Insert-only corruption (blanking only; projection enforced).
+        x_t, pad_mask_t = corrupt_batch_tree_insert_only(
+            x1, pad_mask, t,
+            k=self.k,
+           num_types=self.num_types,
+            scheduler=self.scheduler,
+        )
+
+        # Keep the exact same canonicalization logic as the edit model.
+        x_t, pad_mask_t, orig_idx = canonicalize_bfs_with_orig_idx(x_t, pad_mask_t, k=self.k)
+
+        # Mask for transformer
+        mask = pad_mask_t | (x_t[:, :, 2] == 0)
+
+        rates, ins_logits, sub_logits = self.net(x_t, mask, t)
+
+        # Disable delete/substitute at the *loss / sampling* interface.
+        rates = rates.clone()
+        rates[..., 1:] = 0.0
+        sub_logits = torch.zeros_like(sub_logits)
+
+        current_slots = build_child_slot_types(x_t, pad_mask_t, k=self.k)
+        target_slots_full = build_child_slot_types(x1, pad_mask, k=self.k)
+
+        # gather target slots for canonical parents using orig_idx
+        B, Nc, _ = x_t.shape
+        orig_clamped = orig_idx.clamp(min=0, max=target_slots_full.size(1) - 1)
+        target_slots = target_slots_full.gather(1, orig_clamped.unsqueeze(-1).expand(B, Nc, self.k))
+        target_slots = torch.where(
+            (orig_idx < 0).unsqueeze(-1) | pad_mask_t.unsqueeze(-1),
+            torch.zeros_like(target_slots),
+            target_slots,
+        )
+
+        # psi for insertion only: use existence schedule (child depth = parent depth + 1).
+        parent_depths = x_t[:, :, 0].clamp(min=0, max=self.max_depth).long()
+        child_depths = (parent_depths + 1).clamp(max=self.max_depth).long()
+        if hasattr(self.scheduler, "psi_exist"):
+            psi_parent = self.scheduler.psi_exist(t, child_depths)
+        else:
+            psi_parent = self.scheduler.psi(t, child_depths)
+        psi = psi_parent.unsqueeze(-1).expand(B, Nc, self.k)  # [B,N,K]
+
+        parent_active = (~pad_mask_t) & (x_t[:, :, 2] > 0)
+        if parent_active.sum() == 0:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            nodes_x1 = float(((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean().item())
+            return loss, {"nodes_xt": 0.0, "nodes_x1": nodes_x1}
+
+        rates_s = rates[parent_active]
+        ins_s = ins_logits[parent_active]
+        sub_s = sub_logits[parent_active]  # all zeros
+        cur_s = current_slots[parent_active]
+        tgt_s = target_slots[parent_active]
+        psi_s = psi[parent_active]         # [M,K]
+
+        loss = self.loss_fn(rates_s, ins_s, sub_s, cur_s, tgt_s, psi_s)
+
+        with torch.no_grad():
+            nodes_xt = float(((~pad_mask_t) & (x_t[:, :, 2] > 0)).sum(dim=1).float().mean().item())
+            nodes_x1 = float(((~pad_mask) & (x1[:, :, 2] > 0)).sum(dim=1).float().mean().item())
+        return loss, {"nodes_xt": nodes_xt, "nodes_x1": nodes_x1}
+
+    @torch.no_grad()
+    def sample(self, num_samples: int = 4, steps: int = 300, max_nodes: Optional[int] = None, temperature: float = 1.0):
+        if max_nodes is None:
+            max_nodes = self.max_nodes
+
+        # Wrap net so sampler never sees del/sub rates.
+        class _InsertOnlyWrapper(nn.Module):
+            def __init__(self, net: nn.Module):
+                super().__init__()
+                self.net = net
+            def forward(self, x, mask, t):
+                rates, ins_logits, sub_logits = self.net(x, mask, t)
+                rates = rates.clone()
+                rates[..., 1:] = 0.0
+                sub_logits = torch.zeros_like(sub_logits)
+                return rates, ins_logits, sub_logits
+
+        return sample_tree_ctmc(
+            _InsertOnlyWrapper(self.net),
+            num_samples=num_samples,
+            steps=steps,
+            max_nodes=max_nodes,
+            k=self.k,
+            num_types=self.num_types,
+            root_type=self.root_type,
+            temperature=temperature,
+            device=next(self.parameters()).device,
+        )

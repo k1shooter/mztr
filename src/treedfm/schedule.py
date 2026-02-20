@@ -291,19 +291,36 @@ def estimate_depth_profile(
         binc = torch.bincount(d, minlength=md + 1).to(torch.float64)
         counts += binc
 
-    if not include_root:
-        counts[0] = 0.0
-
+    # IMPORTANT: `include_root=False` should *not* erase the influence of the root on
+    # depth-1 slot counts when `count_mode="all_slots"`.
+    #
+    # We therefore keep a separate `node_counts` (with the root included), then apply
+    # `include_root` only to the "nodes" view.
+    node_counts = counts.clone()
     if count_mode == "nodes":
-        pass
+        counts = node_counts
+        if not include_root:
+            counts[0] = 0.0
     elif count_mode == "all_slots":
-        # counts_slots[d] = k * nodes[d-1]
-        nodes = counts.clone()
-        counts = torch.zeros_like(nodes)
-        counts[1:] = float(k) * nodes[:-1]
+        # slot_mass[d] = k * node_mass[d-1]
+        counts = torch.zeros_like(node_counts)
+        counts[1:] = float(k) * node_counts[:-1]
         counts[0] = 0.0
+        # `include_root` is irrelevant for slot_mass (depth 0 has no parent-slots),
+        # but the root *must* contribute to depth-1.
     else:
         raise ValueError(f"Unknown count_mode: {count_mode}")
+
+    # if count_mode == "nodes":
+    #     pass
+    # elif count_mode == "all_slots":
+    #     # counts_slots[d] = k * nodes[d-1]
+    #     nodes = counts.clone()
+    #     counts = torch.zeros_like(nodes)
+    #     counts[1:] = float(k) * nodes[:-1]
+    #     counts[0] = 0.0
+    # else:
+    #     raise ValueError(f"Unknown count_mode: {count_mode}")
 
     return DepthProfile(counts=counts.to(torch.float32), max_depth=md)
 
@@ -441,3 +458,92 @@ def make_profiled_sequential_schedule(
         widths[0] = float(min_width)
 
     return ProfiledDepthSchedule(starts=starts, widths=widths, max_psi=max_psi, mode=mode, exp_eps=exp_eps)
+
+class TimeOnlySchedule:
+    """Depth-agnostic (time-only) schedule.
+
+    This ablation schedule ignores `depths` and applies the same kappa(t) / psi(t)
+    to every coordinate, then relies on the same *projection* step to enforce
+    tree closure (if parent absent => child absent).
+
+    We provide both:
+      - linear mode: kappa(t)=clamp(t/width,0,1) with psi = kdot/(1-kappa) in-window
+      - exp mode: constant-hazard ramp inside [0,width): kappa(t)=1-exp(-beta*t),
+                  psi(t)=beta (bounded by construction), and kappa=1 after width.
+
+    Notes
+    -----
+    - `max_depth` is only used to set the projection loop count (for compat).
+    - For fair comparisons with depth-aware profiled schedules, consider setting
+      width=1.0 so the mixture spans the full [0,1] time interval.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_depth: int,
+        width: float = 1.0,
+        max_psi: float = 200.0,
+        mode: str = "linear",   # "linear" or "exp"
+        exp_eps: float = 1e-3,
+    ):
+        if max_depth <= 0:
+            raise ValueError("max_depth must be positive")
+        if not (0.0 < float(width) <= 1.0):
+            raise ValueError("width must be in (0,1]")
+        if mode not in ("linear", "exp"):
+            raise ValueError("mode must be 'linear' or 'exp'")
+        if not (0.0 < float(exp_eps) < 1.0):
+            raise ValueError("exp_eps must be in (0,1)")
+        self.max_depth = int(max_depth)
+        self.width = float(width)
+        self.max_psi = float(max_psi)
+        self.mode = str(mode)
+        self.exp_eps = float(exp_eps)
+
+    def _broadcast_t(self, t, ref):
+        if t.dim() != 1:
+            raise ValueError("t must be shape [B]")
+        return t.to(ref.device).view(-1, *([1] * (ref.dim() - 1))).expand_as(ref).float()
+
+    def kappa(self, t, depths):
+        import torch
+        t_b = self._broadcast_t(t, depths)
+        if self.mode == "linear":
+            return torch.clamp(t_b / self.width, 0.0, 1.0)
+
+        # exp mode: constant hazard beta inside [0,width), then clamp to 1.
+        dt = t_b
+        after = dt >= self.width
+        in_window = (~after)
+
+        log_inv_eps = torch.log(torch.tensor(1.0 / self.exp_eps, device=depths.device, dtype=torch.float32))
+        beta = log_inv_eps / torch.clamp(torch.tensor(self.width, device=depths.device), min=1e-6)
+        beta = torch.clamp(beta, max=self.max_psi)
+
+        k_win = 1.0 - torch.exp(-beta * torch.clamp(dt, min=0.0))
+        k = torch.where(in_window, k_win, torch.zeros_like(dt))
+        k = torch.where(after, torch.ones_like(k), k)
+        return k
+
+    def psi(self, t, depths):
+        import torch
+        t_b = self._broadcast_t(t, depths)
+        in_window = (t_b >= 0.0) & (t_b < self.width)
+
+        if self.mode == "linear":
+            kappa = self.kappa(t, depths)
+            denom = torch.clamp(1.0 - kappa, min=1e-6)
+            kdot = (1.0 / self.width) * in_window.float()
+            psi = kdot / denom
+            psi = torch.clamp(psi, 0.0, self.max_psi)
+            return psi * in_window.float()
+
+        # exp mode: psi is constant hazard beta inside the window
+        log_inv_eps = torch.log(torch.tensor(1.0 / self.exp_eps, device=depths.device, dtype=torch.float32))
+        beta = log_inv_eps / torch.clamp(torch.tensor(self.width, device=depths.device), min=1e-6)
+        beta = torch.clamp(beta, max=self.max_psi)
+        return beta * in_window.float()
+
+    def kappa_and_psi(self, t, depths):
+        return self.kappa(t, depths), self.psi(t, depths)

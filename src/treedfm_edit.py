@@ -7,11 +7,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from treedfm.data import MazeTreeDataset, collate_tree_batch
-from treedfm.dfm import TreeEditDFM
+from treedfm.dfm import TreeEditDFM, TreeInsertOnlyDFM
 from treedfm.monitor import TrainingMonitor
 from treedfm.utils import TreeUtils
-from treedfm.schedule import estimate_depth_profile, make_profiled_sequential_schedule
-
+from treedfm.schedule import (
+    estimate_depth_profile,
+    make_profiled_sequential_schedule,
+    SplitKappaSchedule,
+    TimeOnlySchedule,
+)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pkl_path", type=str, required=True)
@@ -88,6 +92,27 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
 
+    # Experiment variants / ablations
+    parser.add_argument(
+       "--variant",
+       type=str,
+       default="edit",
+       choices=["edit", "insert_only"],
+       help="Model/algorithm variant. 'edit' = insert+del+sub (default). 'insert_only' = ablation #1.",
+    )
+    parser.add_argument(
+        "--depth_agnostic_kappa",
+        action="store_true",
+        help="Ablation #2: ignore depth in kappa/psi (time-only schedule), while keeping projection.",
+    )
+    parser.add_argument(
+        "--time_only_width",
+        type=float,
+        default=1.0,
+        help="Width for the time-only schedule used when --depth_agnostic_kappa is set. "
+             "1.0 means the noise/denoise mixture spans the full [0,1] interval.",
+    )
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -116,15 +141,13 @@ def main():
     # Build schedule
     scheduler = None
     if args.schedule_mode == "profiled":
-        profile = estimate_depth_profile(
-            ds.data,
-            max_depth=args.max_depth,
-            k=args.k,
-            count_mode=args.profile_count_mode,
-            include_root=False,
+        # 1) existence용: slot-mass 기반(추천)
+        prof_slots = estimate_depth_profile(
+            ds.data, max_depth=args.max_depth, k=args.k,
+            count_mode="all_slots", include_root=False,
         )
-        scheduler = make_profiled_sequential_schedule(
-            profile,
+        sched_exist = make_profiled_sequential_schedule(
+            prof_slots,
             smoothing=args.profile_smoothing,
             power=args.profile_power,
             min_width=args.profile_min_width,
@@ -134,10 +157,44 @@ def main():
             mode=args.profile_mode,
             exp_eps=args.profile_exp_eps,
         )
-        print("[info] Using profiled sequential schedule.")
-        print("       depth mass (top 10 depths):", profile.counts[:10].tolist())
 
-    model = TreeEditDFM(
+        # 2) type용: node-mass 기반(추천)
+        prof_nodes = estimate_depth_profile(
+            ds.data, max_depth=args.max_depth, k=args.k,
+            count_mode="nodes", include_root=False,
+        )
+        sched_type = make_profiled_sequential_schedule(
+            prof_nodes,
+            smoothing=args.profile_smoothing,
+            power=args.profile_power,
+            min_width=args.profile_min_width,
+            max_psi=args.schedule_max_psi,
+            include_root=False,
+            overlap=args.profile_overlap,
+            mode=args.profile_mode,
+            exp_eps=args.profile_exp_eps,
+        )
+
+        # 3) wrap
+        scheduler = SplitKappaSchedule(exist=sched_exist, typ=sched_type)
+
+    # Ablation #2: depth-agnostic schedule (time-only kappa/psi).
+    # This keeps the same *projection* step, but removes the depth curriculum.
+    if args.depth_agnostic_kappa:
+        time_sched = TimeOnlySchedule(
+            max_depth=args.max_depth,
+            width=args.time_only_width,
+            max_psi=args.schedule_max_psi,
+            mode=args.profile_mode,      # reuse --profile_mode ("linear" or "exp")
+            exp_eps=args.profile_exp_eps,
+        )
+        scheduler = SplitKappaSchedule(exist=time_sched, typ=time_sched)
+
+    # Select model variant
+    ModelClass = TreeEditDFM if args.variant == "edit" else TreeInsertOnlyDFM
+
+
+    model = ModelClass(
         num_types=args.num_types,
         k=args.k,
         max_depth=args.max_depth,
