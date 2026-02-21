@@ -52,13 +52,13 @@ def main():
     parser.add_argument("--profile_smoothing", type=float, default=1.0)
     parser.add_argument("--profile_power", type=float, default=1.0)
     parser.add_argument("--profile_min_width", type=float, default=1e-3)
-    parser.add_argument("--profile_overlap", type=float, default=0.0)
+    parser.add_argument("--profile_overlap", type=float, default=0.1)
     parser.add_argument("--profile_mode", type=str, default="linear", choices=["linear", "exp"])
     parser.add_argument("--profile_exp_eps", type=float, default=1e-3)
 
     # Noise
     parser.add_argument("--p_blank_token", type=float, default=0.9)
-    parser.add_argument("--p_blank_blank", type=float, default=0.98)
+    parser.add_argument("--p_blank_blank", type=float, default=0.95)
     parser.add_argument("--max_spurious", type=int, default=64)
 
     # Matching
@@ -112,6 +112,9 @@ def main():
         help="Width for the time-only schedule used when --depth_agnostic_kappa is set. "
              "1.0 means the noise/denoise mixture spans the full [0,1] interval.",
     )
+
+    parser.add_argument("--type_lag", type=float, default=0.1, 
+                        help="Delay in time [0, 1] for type resolution compared to existence.")
 
     args = parser.parse_args()
 
@@ -174,6 +177,11 @@ def main():
             mode=args.profile_mode,
             exp_eps=args.profile_exp_eps,
         )
+
+        if args.type_lag > 0.0:
+            # 시작 시점(starts)을 type_lag 만큼 뒤로 밀어줍니다. (최대 1.0)
+            starts_type = torch.clamp(sched_type.starts + args.type_lag, max=1.0)
+            sched_type.starts = starts_type
 
         # 3) wrap
         scheduler = SplitKappaSchedule(exist=sched_exist, typ=sched_type)

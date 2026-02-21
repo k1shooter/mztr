@@ -176,26 +176,3 @@ def sample_tree_ctmc(
                                 new_type = int(torch.multinomial(sub_probs[b, parent_idx, r], 1).item()) + 1
                                 tree[c_idx][2] = new_type
     return [_bfs_canonicalize_active(t, k=k) for t in trees]
-    # # Final cleanup: keep only connected active nodes in BFS from root.
-    # final_trees: List[List[List[int]]] = []
-    # for tree in trees:
-    #     # Rebuild child map for traversal
-    #     child_map = _build_child_index(tree, k=k)
-    #     clean: List[List[int]] = []
-    #     queue = [(0, -1)]  # old_idx, new_parent
-    #     while queue:
-    #         old, new_parent = queue.pop(0)
-    #         if old >= len(tree):
-    #             continue
-    #         node = tree[old]
-    #         if node[2] == 0:
-    #             continue
-    #         new_idx = len(clean)
-    #         clean.append([int(node[0]), int(node[1]), int(node[2]), int(new_parent)])
-    #         for r in range(k):
-    #             c = child_map.get((old, r))
-    #             if c is not None:
-    #                 queue.append((c, new_idx))
-    #     final_trees.append(clean)
-
-    # return final_trees

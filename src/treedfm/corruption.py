@@ -93,28 +93,7 @@ def corrupt_batch_tree(
     # --- (A) Corrupt existing target nodes (except root) ---
     # # Sample z0 types for target nodes: blank or random token
     # # For padding rows, keep them as blank.
-    # kappa_nodes = scheduler.kappa(t, depths)  # [B,N]
-    # # Root always kept as its target type
-    # # We'll sample zt for all nodes then enforce closure.
-    # u_choose = torch.rand((B, N), device=device)
-    # choose_target = u_choose < kappa_nodes
 
-    # # noise selector for target-token positions
-    # u_noise = torch.rand((B, N), device=device)
-    # z0_blank = (u_noise < noise.p_blank_when_target_token)  # True => blank
-    # z0_type = _rand_token_like((B, N), num_types=num_types, device=device)
-    # # Optionally avoid "substitution identity" where z0 == z1
-    # if noise.avoid_substitution_identity:
-    #     # same = (z0_type == types_1) & (types_1 > 0)
-    #     # if same.any():
-    #     #     # resample once; if still same it's ok (rare)
-    #     #     z0_type2 = _rand_token_like((B, N), num_types=num_types, device=device)
-    #     #     z0_type = torch.where(same, z0_type2, z0_type)
-    #     same = (z0_type == types_1) & (types_1 > 0)
-    #     while same.any():
-    #         z0_new = _rand_token_like((B, N), num_types=num_types, device=device)
-    #         z0_type = torch.where(same, z0_new, z0_type)
-    #         same = (z0_type == types_1) & (types_1 > 0)
 
     #####################################################################################################################
     # We split the corruption path into:
@@ -142,10 +121,6 @@ def corrupt_batch_tree(
     is_target_token = (types_1 > 0) & (~is_pad)
     #####################################################################################################################
 
-    # # For root: always take target type
-    # zt = torch.where(choose_target, types_1, z0)
-    # zt = torch.where(is_pad, torch.zeros_like(zt), zt)
-    # zt = torch.where(is_root, types_1, zt)
     #####################################################################################################################
     # --- (A-1) sample existence ---
     u_exist = torch.rand((B, N), device=device)
@@ -168,8 +143,7 @@ def corrupt_batch_tree(
     exist_t[:, 0] = True  # root always exists
     #####################################################################################################################
 
-    # # Set types in x_t
-    # x_t[:, :, 2] = zt
+
     #####################################################################################################################
     # --- (A-2) sample type (only meaningful when target exists & we keep a token) ---
     # Default noise type (for the rare case target is blank but exist_t=True on a padded row)
@@ -226,59 +200,7 @@ def corrupt_batch_tree(
     # empty_target_slots = (target_slots == 0)  # [B,N,K]
 
     # # We'll allocate spurious nodes sequentially from padding region per sample.
-    # for b in range(B):
-    #     # Free indices are those still marked as padding in pad_mask_t
-    #     free = torch.nonzero(pad_mask_t[b], as_tuple=False).view(-1).tolist()
-    #     if not free:
-    #         continue
 
-    #     spurious_budget = noise.max_spurious_per_tree
-    #     # Iterate over parents that exist
-    #     parent_indices = torch.nonzero(parent_exist_mask[b], as_tuple=False).view(-1).tolist()
-    #     if not parent_indices:
-    #         continue
-
-    #     for p in parent_indices:
-    #         if spurious_budget <= 0 or not free:
-    #             break
-    #         # Skip if parent is padding (shouldn't happen)
-    #         if pad_mask_t[b, p].item():
-    #             continue
-    #         # Time-dependent mix: z1 is blank for empty slots; so spurious happens when choose_target=False and z0 token.
-    #         kappa_p = float(kappa_child[b, p].item())
-    #         # Pre-sample choose_target for the K slots
-    #         u = torch.rand((k,), device=device)
-    #         choose_target_slot = (u < kappa_p)  # True => keep blank
-    #         # Noise z0 for empty target slot: blank or token
-    #         u0 = torch.rand((k,), device=device)
-    #         z0_blank_slot = (u0 < noise.p_blank_when_target_blank)
-    #         z0_type_slot = _rand_token_like((k,), num_types=num_types, device=device)
-    #         zt_slot = torch.where(choose_target_slot, torch.zeros_like(z0_type_slot), torch.where(z0_blank_slot, torch.zeros_like(z0_type_slot), z0_type_slot))
-
-    #         for r in range(k):
-    #             if spurious_budget <= 0 or not free:
-    #                 break
-    #             if not empty_target_slots[b, p, r].item():
-    #                 continue  # target already has a child at this slot
-    #             if zt_slot[r].item() == 0:
-    #                 continue  # no spurious here                # Also ensure the slot is currently empty in x_t (no real child survived)
-    #             if current_slots[b, p, r].item() != 0:
-    #                 continue
-
-    #             idx = free.pop(0)
-    #             # Activate this padding row
-    #             pad_mask_t[b, idx] = False
-    #             spurious_budget -= 1
-
-    #             # Fill node features
-    #             parent_depth = int(x_t[b, p, 0].item())
-    #             x_t[b, idx, 0] = parent_depth + 1
-    #             x_t[b, idx, 1] = r
-    #             x_t[b, idx, 2] = int(zt_slot[r].item())
-    #             current_slots[b, p, r] = int(zt_slot[r].item())
-    #             x_t[b, idx, 3] = p
-
-    #     # Any remaining free indices stay padding
     #####################################################################################################################
     max_spurious = int(noise.max_spurious_per_tree)
     if max_spurious > 0:

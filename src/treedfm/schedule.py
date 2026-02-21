@@ -311,16 +311,6 @@ def estimate_depth_profile(
     else:
         raise ValueError(f"Unknown count_mode: {count_mode}")
 
-    # if count_mode == "nodes":
-    #     pass
-    # elif count_mode == "all_slots":
-    #     # counts_slots[d] = k * nodes[d-1]
-    #     nodes = counts.clone()
-    #     counts = torch.zeros_like(nodes)
-    #     counts[1:] = float(k) * nodes[:-1]
-    #     counts[0] = 0.0
-    # else:
-    #     raise ValueError(f"Unknown count_mode: {count_mode}")
 
     return DepthProfile(counts=counts.to(torch.float32), max_depth=md)
 

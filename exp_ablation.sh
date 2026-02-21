@@ -7,7 +7,7 @@ set -euo pipefail
 #   bash run_ablations.sh maze_trees_relative.pkl runs/ablations
 
 PKL_PATH=${1:-maze_trees_relative.pkl}
-BASE_SAVE=${2:-runs/ablations}
+BASE_SAVE=${2:-runs1/ablations}
 
 mkdir -p "${BASE_SAVE}"
 
@@ -17,7 +17,7 @@ COMMON_ARGS=(
   --max_depth 80 --k 3 --num_types 3
   --expected_nodes 100
   --pad_to 200 --max_nodes 256
-  --batch_size 256 --epochs 20000
+  --batch_size 256 --epochs 30000
   --sample_every_epochs 5 --sample_steps 500
   --profile_count_mode nodes
   --profile_mode exp
