@@ -9,7 +9,7 @@ from collections import defaultdict
 import argparse
 import pandas as pd
 import glob
-
+import random
 # treedfm 모듈 임포트를 위한 경로 설정
 sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
 
@@ -18,6 +18,26 @@ try:
 except ImportError as e:
     print(f"Error: Could not import treedfm modules. {e}")
     sys.exit(1)
+
+from treedfm.schedule import (
+    estimate_depth_profile,
+    make_profiled_sequential_schedule,
+    SplitKappaSchedule,
+    TimeOnlySchedule,
+)
+
+# ==========================================
+# 0. Seed Fix Function
+# ==========================================
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # Multi-GPU 대비
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 # ==========================================
 # 1. Maze Logic & Analyzer
@@ -192,7 +212,7 @@ class MazeVisualizer:
 # ==========================================
 # 3. Ablation-Aware Dynamic Loader
 # ==========================================
-def load_ablation_model(ckpt_path, ablation_name, device):
+def load_ablation_model(ckpt_path, ablation_name, device, train_data_list=None):
     ckpt = torch.load(ckpt_path, map_location=device)
     
     # 1. 학습 당시 args 복원
@@ -203,46 +223,91 @@ def load_ablation_model(ckpt_path, ablation_name, device):
     config = {
         'num_types': train_args.get('num_types', 3),
         'k': train_args.get('k', 3),
-        'max_depth': train_args.get('max_depth', 16),
-        'max_nodes': train_args.get('max_nodes', 128),
+        'max_depth': train_args.get('max_depth', 80), 
+        'max_nodes': train_args.get('max_nodes', 256),
         'd_model': train_args.get('d_model', 384),
         'n_heads': train_args.get('n_heads', 8),
         'n_layers': train_args.get('n_layers', 8),
-        'permutation_invariant': not train_args.get('no_perm_invariant', False)
+        'permutation_invariant': not train_args.get('no_perm_invariant', False),
+        'p_blank_when_target_token': train_args.get('p_blank_token', 0.9),
+        'p_blank_when_target_blank': train_args.get('p_blank_blank', 0.95),
+        'schedule_width': train_args.get('schedule_width', 0.5),             # 추가
+        'schedule_max_psi': train_args.get('schedule_max_psi', 200.0),       # 추가
+        'max_spurious_per_tree': train_args.get('max_spurious', 64),         # 추가
     }
 
-    # 2. Ablation에 따른 명시적 모델 맵핑
-    if "insert_only" in ablation_name:
-        from treedfm.dfm import TreeInsertOnlyDFM
-        print(f"  -> [Ablation 1] Assigned TreeInsertOnlyDFM")
-        model = TreeInsertOnlyDFM(**config)
-
-    elif "depth_agnostic" in ablation_name:
-        from treedfm.dfm import TreeEditDFM
-        from treedfm.schedule import TimeOnlySchedule
-        print(f"  -> [Ablation 2] Assigned TreeEditDFM with TimeOnlySchedule")
-        
-        # Depth Agnostic을 위한 TimeOnlySchedule 생성
-        scheduler = TimeOnlySchedule(
-            max_depth=config['max_depth'], 
-            width=train_args.get('schedule_width', 0.5), 
-            max_psi=train_args.get('schedule_max_psi', 200.0)
+    # ==========================================
+    # 2. 확실한 스케줄러 복원 (학습 코드와 100% 동일하게)
+    # ==========================================
+    scheduler = None
+    if train_args.get('depth_agnostic_kappa', False):
+        print(f"  -> Rebuilding TimeOnlySchedule for Depth-Agnostic Ablation")
+        time_sched = TimeOnlySchedule(
+            max_depth=train_args.get('max_depth', 80),
+            width=train_args.get('time_only_width', 1.0),
+            max_psi=train_args.get('schedule_max_psi', 200.0),
+            mode=train_args.get('profile_mode', 'exp'),
+            exp_eps=train_args.get('profile_exp_eps', 1e-3),
         )
-        model = TreeEditDFM(**config, scheduler=scheduler)
+        # 중요: 학습 코드와 동일하게 SplitKappaSchedule로 래핑
+        scheduler = SplitKappaSchedule(exist=time_sched, typ=time_sched)
 
-    elif "baseline_edit" in ablation_name:
-        from treedfm.dfm import TreeEditDFM
-        print(f"  -> [Baseline] Assigned TreeEditDFM (Default/Profiled Schedule)")
-        # baseline은 treeeval_new.py 의 방식 그대로 처리
-        model = TreeEditDFM(**config)
+    elif train_args.get('schedule_mode', 'profiled') == 'profiled':
+        print(f"  -> Rebuilding Profiled SplitKappaSchedule")
+        if train_data_list is None:
+            raise ValueError("train_data_list is required to rebuild profiled scheduler!")
+            
+        prof_slots = estimate_depth_profile(
+            train_data_list, max_depth=train_args.get('max_depth', 80), k=train_args.get('k', 3),
+            count_mode="all_slots", include_root=False,
+        )
+        sched_exist = make_profiled_sequential_schedule(
+            prof_slots,
+            smoothing=train_args.get('profile_smoothing', 1.0),
+            power=train_args.get('profile_power', 1.0),
+            min_width=train_args.get('profile_min_width', 1e-3),
+            max_psi=train_args.get('schedule_max_psi', 200.0),
+            include_root=False,
+            overlap=train_args.get('profile_overlap', 0.1),
+            mode=train_args.get('profile_mode', 'exp'),
+            exp_eps=train_args.get('profile_exp_eps', 1e-3),
+        )
+
+        prof_nodes = estimate_depth_profile(
+            train_data_list, max_depth=train_args.get('max_depth', 80), k=train_args.get('k', 3),
+            count_mode="nodes", include_root=False,
+        )
+        sched_type = make_profiled_sequential_schedule(
+            prof_nodes,
+            smoothing=train_args.get('profile_smoothing', 1.0),
+            power=train_args.get('profile_power', 1.0),
+            min_width=train_args.get('profile_min_width', 1e-3),
+            max_psi=train_args.get('schedule_max_psi', 200.0),
+            include_root=False,
+            overlap=train_args.get('profile_overlap', 0.1),
+            mode=train_args.get('profile_mode', 'exp'),
+            exp_eps=train_args.get('profile_exp_eps', 1e-3),
+        )
+
+        if train_args.get('type_lag', 0.1) > 0.0:
+            starts_type = torch.clamp(sched_type.starts + train_args.get('type_lag', 0.1), max=1.0)
+            sched_type.starts = starts_type
+
+        scheduler = SplitKappaSchedule(exist=sched_exist, typ=sched_type)
         
+    config['scheduler'] = scheduler
+
+    # ==========================================
+    # 3. 모델 인스턴스화 및 State Dict 로드
+    # ==========================================
+    variant = train_args.get('variant', 'edit')
+    if variant == "insert_only":
+        from treedfm.dfm import TreeInsertOnlyDFM
+        model = TreeInsertOnlyDFM(**config)
     else:
-        # 그 외의 경우 기본 EditDFM 사용
         from treedfm.dfm import TreeEditDFM
-        print(f"  -> [Unknown Ablation] Fallback to TreeEditDFM")
         model = TreeEditDFM(**config)
 
-    # 3. State Dict 로드 (treedfm_edit.py 로 학습했으므로 nn.Module 포맷 그대로 사용)
     state_dict = ckpt.get('model_state', ckpt)
     model.load_state_dict(state_dict, strict=False)
     
@@ -260,7 +325,11 @@ def main():
     parser.add_argument("--train_data", type=str, default="maze_trees_relative.pkl")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--out_dir", type=str, default="ablation_eval_results")
+    parser.add_argument("--seed", type=int, default=42) # 시드 인자 추가
     args = parser.parse_args()
+
+    set_seed(args.seed)
+    print(f"[*] Seed uniformly set to {args.seed}")
 
     # 정확한 폴더 3개 명시
     TARGET_FOLDERS = [
@@ -270,7 +339,7 @@ def main():
     ]
     
     ckpt_files = []
-    base_dir = os.path.join("runs", "ablations")
+    base_dir = os.path.join("runs1", "ablations")
     
     for folder in TARGET_FOLDERS:
         path = os.path.join(base_dir, folder, "last.pt")
@@ -292,15 +361,17 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Train 데이터 사이즈 분포 로드 (Truncation 방지)
+    # Train 데이터 사이즈 분포 로드 (Truncation 방지 및 Scheduler 프로파일링 용도)
     train_sizes = []
+    train_data_list = None # 추가
     if os.path.exists(args.train_data):
         print(f"\nLoading reference training data: {args.train_data}")
-        # max_depth를 충분히 크게 주어 (예: 999) 트리가 잘리지 않도록 함
         ds = MazeTreeDataset(args.train_data, max_depth=999, k=3)
         train_sizes = [int(x.size(0)) for x in ds.data]
+        train_data_list = ds.data # 추가: 스케줄러 재구축을 위해 저장
         print(f"Loaded {len(train_sizes)} training trees. Max size: {max(train_sizes)}")
     else:
-        print(f"\n[Warning] Training data not found at '{args.train_data}'. Histogram will only show generated sizes.")
+        print(f"\n[Warning] Training data not found at '{args.train_data}'.")
 
     all_results = []
     size_distributions = {'Train': train_sizes} if train_sizes else {}
@@ -310,10 +381,14 @@ def main():
     for ckpt_path in ckpt_files:
         ablation_name = os.path.basename(os.path.dirname(ckpt_path))
         print(f"\n[{ablation_name}] Loading and Sampling {args.num_samples} trees...")
-        
+
+        ckpt = torch.load(ckpt_path, map_location=device)
+        train_args = ckpt.get('args', {})
+        if isinstance(train_args, argparse.Namespace): 
+            train_args = vars(train_args)
+
         # 앞서 구현한 Ablation-Aware 모델 로더 호출
-        model = load_ablation_model(ckpt_path, ablation_name, device)
-        
+        model = load_ablation_model(ckpt_path, ablation_name, device, train_data_list=train_data_list)
         vis_dir = os.path.join(args.out_dir, ablation_name)
         visualizer = MazeVisualizer(vis_dir)
 
@@ -321,11 +396,14 @@ def main():
         generated_trees = []
         batch_size = 25
         num_batches = (args.num_samples + batch_size - 1) // batch_size
+
+        eval_steps = train_args.get('sample_steps', 500)
+        eval_max_nodes = train_args.get('max_nodes', 256)
         
         with torch.no_grad():
             for b in range(num_batches):
                 b_size = min(batch_size, args.num_samples - len(generated_trees))
-                trees = model.sample(num_samples=b_size, steps=300, max_nodes=130, temperature=1.0)
+                trees = model.sample(num_samples=b_size, steps=eval_steps, max_nodes=eval_max_nodes, temperature=1.0)
                 generated_trees.extend(trees)
                 print(f"    Sampled {len(generated_trees)}/{args.num_samples}")
 
