@@ -25,7 +25,8 @@ def main():
     parser.add_argument("--max_depth", type=int, default=128)
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--num_types", type=int, default=3)
-
+    parser.add_argument("--root_type", type=int, default=2,
+                        help="Root node type used during sampling.")
     # Training
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=256)
@@ -218,6 +219,7 @@ def main():
         n_layers=args.n_layers,
         dropout=args.dropout,
         scheduler=scheduler,
+        root_type=args.root_type,
     ).to(args.device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)

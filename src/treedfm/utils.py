@@ -130,6 +130,7 @@ class TreeUtils:
         Skips inactive nodes with type==0.
         """
         G = nx.Graph()
+        labels = {}
         for i, n in enumerate(nodes_list):
             if isinstance(n, torch.Tensor):
                 n = n.tolist()
@@ -137,6 +138,7 @@ class TreeUtils:
             if typ == 0:
                 continue
             G.add_node(i, type=typ, depth=depth)
+            labels[i] = f"{i}\n(T:{int(typ)})"
             if parent != -1 and parent < len(nodes_list):
                 # only connect if parent exists and is active
                 parent_typ = nodes_list[parent][2] if not isinstance(nodes_list[parent], torch.Tensor) else int(nodes_list[parent][2])
@@ -163,7 +165,8 @@ class TreeUtils:
             for node_id in G.nodes():
                 typ = G.nodes[node_id].get("type", 0)
                 node_colors.append(colors[min(max(int(typ), 0), len(colors) - 1)])
-            nx.draw(G, pos, node_color=node_colors, with_labels=True, node_size=300)
+            nx.draw(G, pos, node_color=node_colors, with_labels=True, labels=labels, 
+                    node_size=600, font_size=8, edge_color="gray")
 
         plt.title(title)
         plt.savefig(filename)
